@@ -50,3 +50,21 @@
 - Fixed `item_order_keys` for statediffs, balances, token_balances, rewards
 - Field group emission: emit group when writers exist, not based on non-null values
 - **Sort precompute**: `build_full_sort_columns()` + column index resolution moved outside per-block `par_iter` loop into `IndexedBatches` struct. Eliminates per-block `Vec<String>` allocation, `HashSet` construction, and `schema().index_of()` lookups.
+
+### Substrate & Naming
+- Fixed moonbeam_example_giant_squid_stats weight mismatch: added `weight: 128` to extrinsics.signature in substrate.yaml (matches legacy `set_weight("signature", 4*32)`)
+- Renamed `include_equal` → `inclusive` with detailed English comments explaining cross-table vs self-join semantics
+
+### Hyperliquid Support
+- Added `metadata/hyperliquid_fills.yaml` (blocks + fills, sorted by user/coin)
+- Added `metadata/hyperliquid_replica_cmds.yaml` (blocks + actions with weight columns, query aliases for order/cancel/cancelByCloid/batchModify actions)
+- `ListContainsAnyPredicate`: new predicate type for List\<UInt32\>/List\<String\> columns
+- Scalar string equality filter support (`status: "ok"` → `col_eq(key, Utf8)`)
+- `QueryAlias` mechanism: implicit predicates + filter aliases map query names to underlying tables
+- 7 new e2e fixture tests (3 fills + 4 replica_cmds)
+
+### Benchmark Data Update
+- Switched benchmark data to fresh R2 production chunks (ETH: 224 blocks, SOL: 48 blocks)
+- Updated benchmark queries: USDT for tx+logs, USDC for traces+statediffs, Jupiter for sol/instr+logs
+- Added sol/hard benchmark (Meteora DLMM, matches legacy solana_hard query)
+- New engine wins all throughput benchmarks at CPU>=4 (1.07x–2.58x faster than legacy)
