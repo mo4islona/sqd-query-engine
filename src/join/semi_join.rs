@@ -60,12 +60,7 @@ impl TypedExtractor {
                     ))
                 }
             },
-            dt => {
-                return Err(anyhow!(
-                    "unsupported join key column type: {:?}",
-                    dt
-                ))
-            }
+            dt => return Err(anyhow!("unsupported join key column type: {:?}", dt)),
         })
     }
 
@@ -446,14 +441,10 @@ mod tests {
 
     #[test]
     fn test_semi_join_unsupported_key_type() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("x", DataType::Float64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Float64Array::from(vec![1.0, 2.0]))],
-        )
-        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![1.0, 2.0]))])
+                .unwrap();
 
         let err = semi_join(&[batch.clone()], &["x"], &[batch], &["x"]);
         assert!(err.is_err(), "Float64 key should be rejected");
