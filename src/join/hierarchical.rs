@@ -54,7 +54,7 @@ fn make_group_key(
             if a.is_null(row) {
                 return Ok(None);
             }
-            buf.extend_from_slice(&(a.value(row) as u64).to_le_bytes());
+            buf.extend_from_slice(&((a.value(row) as u32) as u64).to_le_bytes());
         } else {
             return Err(anyhow!(
                 "unsupported group key column type: {:?}",
