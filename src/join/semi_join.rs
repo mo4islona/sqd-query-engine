@@ -3,22 +3,11 @@ use arrow::array::*;
 use arrow::compute;
 use arrow::datatypes::SchemaRef;
 use std::collections::HashSet;
-use std::sync::Arc;
 
 /// A composite key for joining on multiple columns.
 /// Stores a hash + row data for equality comparison.
 #[derive(Clone, Eq, PartialEq, Hash)]
 struct CompositeKey(Vec<u8>);
-
-/// Append a single value from an array to the key buffer (fallback for unknown types).
-fn append_value_to_key(buf: &mut Vec<u8>, array: &Arc<dyn Array>, row: usize) {
-    if array.is_null(row) {
-        buf.push(0);
-        return;
-    }
-    buf.push(1);
-    buf.extend_from_slice(&(row as u64).to_le_bytes());
-}
 
 /// Resolve column names to column indices in a batch schema.
 fn resolve_key_indices(schema: &SchemaRef, key_columns: &[&str]) -> Result<Vec<usize>> {
@@ -44,14 +33,13 @@ enum TypedExtractor {
     Boolean(usize),
     FixedBinary(usize),
     ListInt32(usize),
-    Fallback(usize),
 }
 
 impl TypedExtractor {
-    fn new(batch: &RecordBatch, col_idx: usize) -> Self {
+    fn new(batch: &RecordBatch, col_idx: usize) -> Result<Self> {
         let col = batch.column(col_idx);
         let dt = col.data_type();
-        match dt {
+        Ok(match dt {
             arrow::datatypes::DataType::UInt32 => Self::UInt32(col_idx),
             arrow::datatypes::DataType::UInt64 => Self::UInt64(col_idx),
             arrow::datatypes::DataType::Int32 => Self::Int32(col_idx),
@@ -62,8 +50,13 @@ impl TypedExtractor {
             arrow::datatypes::DataType::Boolean => Self::Boolean(col_idx),
             arrow::datatypes::DataType::FixedSizeBinary(_) => Self::FixedBinary(col_idx),
             arrow::datatypes::DataType::List(_) => Self::ListInt32(col_idx),
-            _ => Self::Fallback(col_idx),
-        }
+            dt => {
+                return Err(anyhow!(
+                    "unsupported join key column type: {:?}",
+                    dt
+                ))
+            }
+        })
     }
 
     #[inline]
@@ -162,9 +155,6 @@ impl TypedExtractor {
                     }
                 }
             }
-            Self::Fallback(i) => {
-                append_value_to_key(buf, batch.column(*i), row);
-            }
         }
     }
 }
@@ -190,7 +180,7 @@ fn build_key_set(batches: &[RecordBatch], key_columns: &[&str]) -> Result<HashSe
         let extractors: Vec<TypedExtractor> = indices
             .iter()
             .map(|&i| TypedExtractor::new(batch, i))
-            .collect();
+            .collect::<Result<_>>()?;
         for row in 0..batch.num_rows() {
             set.insert(extract_key_typed(batch, row, &extractors));
         }
@@ -230,17 +220,18 @@ pub fn semi_join(
         let extractors: Vec<TypedExtractor> = indices
             .iter()
             .map(|&i| TypedExtractor::new(batch, i))
-            .collect();
+            .collect::<Result<_>>()?;
         let mut matches = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
             let key = extract_key_typed(batch, row, &extractors);
             matches.push(key_set.contains(&key));
         }
         let mask = BooleanArray::from(matches);
-        if mask.true_count() == 0 {
+        let tc = mask.true_count();
+        if tc == 0 {
             continue;
         }
-        if mask.true_count() == batch.num_rows() {
+        if tc == batch.num_rows() {
             result.push(batch.clone());
         } else {
             result.push(compute::filter_record_batch(batch, &mask)?);
@@ -274,6 +265,7 @@ pub fn lookup_join(
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
 
     fn make_batch(block_numbers: Vec<u64>, tx_indices: Vec<u32>, extra: Vec<&str>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
