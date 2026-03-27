@@ -147,16 +147,42 @@ impl ArrayPredicate for EqPredicate {
                 eq(arr, &UInt16Array::new_scalar(*v)).unwrap()
             }
             ScalarValue::UInt32(v) => {
-                let Some(arr) = array.as_any().downcast_ref::<UInt32Array>() else {
-                    return BooleanArray::from(vec![false; array.len()]);
-                };
-                eq(arr, &UInt32Array::new_scalar(*v)).unwrap()
+                // Try exact type, then parquet physical types (Int32, UInt16, Int16)
+                if let Some(arr) = array.as_any().downcast_ref::<UInt32Array>() {
+                    eq(arr, &UInt32Array::new_scalar(*v)).unwrap()
+                } else if let Some(arr) = array.as_any().downcast_ref::<Int32Array>() {
+                    eq(arr, &Int32Array::new_scalar(*v as i32)).unwrap()
+                } else if let Some(arr) = array.as_any().downcast_ref::<UInt16Array>() {
+                    if let Ok(v16) = u16::try_from(*v) {
+                        eq(arr, &UInt16Array::new_scalar(v16)).unwrap()
+                    } else {
+                        BooleanArray::from(vec![false; array.len()])
+                    }
+                } else {
+                    BooleanArray::from(vec![false; array.len()])
+                }
             }
             ScalarValue::UInt64(v) => {
-                let Some(arr) = array.as_any().downcast_ref::<UInt64Array>() else {
-                    return BooleanArray::from(vec![false; array.len()]);
-                };
-                eq(arr, &UInt64Array::new_scalar(*v)).unwrap()
+                // Try exact type, then parquet physical types (Int64, UInt32, Int32)
+                if let Some(arr) = array.as_any().downcast_ref::<UInt64Array>() {
+                    eq(arr, &UInt64Array::new_scalar(*v)).unwrap()
+                } else if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
+                    eq(arr, &Int64Array::new_scalar(*v as i64)).unwrap()
+                } else if let Some(arr) = array.as_any().downcast_ref::<UInt32Array>() {
+                    if let Ok(v32) = u32::try_from(*v) {
+                        eq(arr, &UInt32Array::new_scalar(v32)).unwrap()
+                    } else {
+                        BooleanArray::from(vec![false; array.len()])
+                    }
+                } else if let Some(arr) = array.as_any().downcast_ref::<Int32Array>() {
+                    if let Ok(v32) = u32::try_from(*v) {
+                        eq(arr, &Int32Array::new_scalar(v32 as i32)).unwrap()
+                    } else {
+                        BooleanArray::from(vec![false; array.len()])
+                    }
+                } else {
+                    BooleanArray::from(vec![false; array.len()])
+                }
             }
             ScalarValue::Int16(v) => {
                 let Some(arr) = array.as_any().downcast_ref::<Int16Array>() else {
