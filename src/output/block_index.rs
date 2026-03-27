@@ -3,20 +3,48 @@ use arrow::record_batch::RecordBatch;
 use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 
-/// Read a block number column value as u64, handling signed parquet physical types.
-/// Parquet stores UInt32/UInt64 as Int32/Int64 physical types, so we reinterpret
-/// the bit pattern rather than sign-extending.
-fn read_block_number(col: &dyn Array, row: usize) -> Option<u64> {
-    if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
-        Some(a.value(row))
-    } else if let Some(a) = col.as_any().downcast_ref::<UInt32Array>() {
-        Some(a.value(row) as u64)
-    } else if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
-        Some(a.value(row) as u64)
-    } else if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
-        Some((a.value(row) as u32) as u64)
-    } else {
-        None
+/// Typed block number reader — downcasts once per column, reads per row without branching.
+/// Parquet stores UInt32/UInt64 as Int32/Int64 physical types, so Int32 is reinterpreted
+/// via u32 to avoid sign-extension.
+enum BlockNumberReader<'a> {
+    UInt64(&'a UInt64Array),
+    UInt32(&'a UInt32Array),
+    Int64(&'a Int64Array),
+    Int32(&'a Int32Array),
+}
+
+impl BlockNumberReader<'_> {
+    fn resolve(col: &dyn Array) -> Option<BlockNumberReader<'_>> {
+        if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
+            Some(BlockNumberReader::UInt64(a))
+        } else if let Some(a) = col.as_any().downcast_ref::<UInt32Array>() {
+            Some(BlockNumberReader::UInt32(a))
+        } else if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+            Some(BlockNumberReader::Int64(a))
+        } else if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
+            Some(BlockNumberReader::Int32(a))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn read(&self, row: usize) -> u64 {
+        match self {
+            Self::UInt64(a) => a.value(row),
+            Self::UInt32(a) => a.value(row) as u64,
+            Self::Int64(a) => a.value(row) as u64,
+            Self::Int32(a) => (a.value(row) as u32) as u64,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::UInt64(a) => a.len(),
+            Self::UInt32(a) => a.len(),
+            Self::Int64(a) => a.len(),
+            Self::Int32(a) => a.len(),
+        }
     }
 }
 
@@ -30,8 +58,9 @@ pub(crate) fn compute_block_range(
 
     for batch in batches {
         if let Some(col) = batch.column_by_name(bn_column) {
-            for i in 0..col.len() {
-                if let Some(bn) = read_block_number(col.as_ref(), i) {
+            if let Some(reader) = BlockNumberReader::resolve(col.as_ref()) {
+                for i in 0..reader.len() {
+                    let bn = reader.read(i);
                     min_block = Some(min_block.map_or(bn, |m: u64| m.min(bn)));
                     max_block = Some(max_block.map_or(bn, |m: u64| m.max(bn)));
                 }
@@ -49,9 +78,12 @@ pub(crate) fn build_block_index(
     let mut index: FxHashMap<u64, Vec<(usize, usize)>> = FxHashMap::default();
     for (batch_idx, batch) in batches.iter().enumerate() {
         if let Some(col) = batch.column_by_name(bn_column) {
-            for row in 0..col.len() {
-                if let Some(bn) = read_block_number(col.as_ref(), row) {
-                    index.entry(bn).or_default().push((batch_idx, row));
+            if let Some(reader) = BlockNumberReader::resolve(col.as_ref()) {
+                for row in 0..reader.len() {
+                    index
+                        .entry(reader.read(row))
+                        .or_default()
+                        .push((batch_idx, row));
                 }
             }
         }
@@ -67,9 +99,9 @@ pub(crate) fn collect_block_numbers(
 ) {
     for batch in batches {
         if let Some(col) = batch.column_by_name(bn_column) {
-            for i in 0..col.len() {
-                if let Some(bn) = read_block_number(col.as_ref(), i) {
-                    block_numbers.insert(bn);
+            if let Some(reader) = BlockNumberReader::resolve(col.as_ref()) {
+                for i in 0..reader.len() {
+                    block_numbers.insert(reader.read(i));
                 }
             }
         }
@@ -87,8 +119,9 @@ pub(crate) fn collect_boundary_blocks(
 
     for batch in batches {
         if let Some(col) = batch.column_by_name(bn_column) {
-            for i in 0..col.len() {
-                if let Some(v) = read_block_number(col.as_ref(), i) {
+            if let Some(reader) = BlockNumberReader::resolve(col.as_ref()) {
+                for i in 0..reader.len() {
+                    let v = reader.read(i);
                     min_block = Some(min_block.map_or(v, |m: u64| m.min(v)));
                     max_block = Some(max_block.map_or(v, |m: u64| m.max(v)));
                 }

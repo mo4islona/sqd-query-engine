@@ -49,7 +49,17 @@ impl TypedExtractor {
             arrow::datatypes::DataType::UInt8 => Self::UInt8(col_idx),
             arrow::datatypes::DataType::Boolean => Self::Boolean(col_idx),
             arrow::datatypes::DataType::FixedSizeBinary(_) => Self::FixedBinary(col_idx),
-            arrow::datatypes::DataType::List(_) => Self::ListInt32(col_idx),
+            arrow::datatypes::DataType::List(field) => match field.data_type() {
+                arrow::datatypes::DataType::UInt32
+                | arrow::datatypes::DataType::Int32
+                | arrow::datatypes::DataType::UInt16 => Self::ListInt32(col_idx),
+                child_dt => {
+                    return Err(anyhow!(
+                        "unsupported list element type for join key: {:?}",
+                        child_dt
+                    ))
+                }
+            },
             dt => {
                 return Err(anyhow!(
                     "unsupported join key column type: {:?}",

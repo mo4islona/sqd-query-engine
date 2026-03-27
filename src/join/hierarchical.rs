@@ -26,23 +26,43 @@ fn extract_address(array: &GenericListArray<i32>, row: usize) -> Vec<u32> {
 #[derive(Clone, Eq, PartialEq, Hash)]
 struct GroupKey(Vec<u8>);
 
-fn make_group_key(batch: &RecordBatch, row: usize, key_indices: &[usize]) -> Result<GroupKey> {
+/// Returns `Ok(None)` when any key column is null at this row (row is ungroupable).
+fn make_group_key(
+    batch: &RecordBatch,
+    row: usize,
+    key_indices: &[usize],
+) -> Result<Option<GroupKey>> {
     let mut buf = Vec::with_capacity(key_indices.len() * 8);
     for &idx in key_indices {
         let col = batch.column(idx);
         if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
-            buf.extend_from_slice(&(a.value(row) as u64).to_le_bytes());
+            if a.is_null(row) {
+                return Ok(None);
+            }
+            buf.extend_from_slice(&a.value(row).to_le_bytes());
         } else if let Some(a) = col.as_any().downcast_ref::<UInt32Array>() {
+            if a.is_null(row) {
+                return Ok(None);
+            }
             buf.extend_from_slice(&(a.value(row) as u64).to_le_bytes());
         } else if let Some(a) = col.as_any().downcast_ref::<UInt16Array>() {
+            if a.is_null(row) {
+                return Ok(None);
+            }
             buf.extend_from_slice(&(a.value(row) as u64).to_le_bytes());
         } else if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
+            if a.is_null(row) {
+                return Ok(None);
+            }
             buf.extend_from_slice(&(a.value(row) as u64).to_le_bytes());
         } else {
-            return Err(anyhow!("unsupported group key column type: {:?}", col.data_type()));
+            return Err(anyhow!(
+                "unsupported group key column type: {:?}",
+                col.data_type()
+            ));
         }
     }
-    Ok(GroupKey(buf))
+    Ok(Some(GroupKey(buf)))
 }
 
 fn resolve_indices(schema: &SchemaRef, columns: &[&str]) -> Result<Vec<usize>> {
@@ -104,7 +124,9 @@ pub fn find_children(
             })?;
 
         for row in 0..batch.num_rows() {
-            let gk = make_group_key(batch, row, &key_indices)?;
+            let Some(gk) = make_group_key(batch, row, &key_indices)? else {
+                continue;
+            };
             let addr = extract_address(addr_array, row);
             source_addresses.entry(gk).or_default().push(addr);
         }
@@ -136,7 +158,10 @@ pub fn find_children(
                 matches.push(false);
                 continue;
             }
-            let gk = make_group_key(batch, row, &key_indices)?;
+            let Some(gk) = make_group_key(batch, row, &key_indices)? else {
+                matches.push(false);
+                continue;
+            };
             let target_addr = extract_address(addr_array, row);
 
             let is_child = source_addresses
@@ -214,7 +239,9 @@ pub fn find_parents(
             })?;
 
         for row in 0..batch.num_rows() {
-            let gk = make_group_key(batch, row, &key_indices)?;
+            let Some(gk) = make_group_key(batch, row, &key_indices)? else {
+                continue;
+            };
             let addr = extract_address(addr_array, row);
             source_addresses.entry(gk).or_default().push(addr);
         }
@@ -245,7 +272,10 @@ pub fn find_parents(
                 matches.push(false);
                 continue;
             }
-            let gk = make_group_key(batch, row, &key_indices)?;
+            let Some(gk) = make_group_key(batch, row, &key_indices)? else {
+                matches.push(false);
+                continue;
+            };
             let target_addr = extract_address(addr_array, row);
 
             let is_parent = source_addresses
