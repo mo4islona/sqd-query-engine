@@ -163,6 +163,10 @@ impl TypedExtractor {
                     for j in 0..arr.len() {
                         buf.extend_from_slice(&arr.value(j).to_le_bytes());
                     }
+                } else if let Some(arr) = values.as_any().downcast_ref::<UInt16Array>() {
+                    for j in 0..arr.len() {
+                        buf.extend_from_slice(&(arr.value(j) as u32).to_le_bytes());
+                    }
                 }
             }
         }
@@ -457,6 +461,67 @@ mod tests {
             err.unwrap_err().to_string().contains("unsupported"),
             "error should mention unsupported type"
         );
+    }
+
+    #[test]
+    fn test_semi_join_list_uint16_keys() {
+        // Regression: List<UInt16> was accepted by TypedExtractor but append()
+        // only handled UInt32/Int32 elements, writing only the list length.
+        // Two rows with different UInt16 values but equal list length would
+        // produce identical keys → false join matches.
+        let list_field = Arc::new(Field::new("item", DataType::UInt16, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("addr", DataType::List(list_field.clone()), false),
+            Field::new("data", DataType::Utf8, false),
+        ]));
+
+        let mut build_list =
+            ListBuilder::new(UInt16Builder::new()).with_field((*list_field).clone());
+        // Build side: one row with addr=[10, 20]
+        build_list.values().append_value(10u16);
+        build_list.values().append_value(20u16);
+        build_list.append(true);
+
+        let build = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(build_list.finish()),
+                Arc::new(StringArray::from(vec!["build"])),
+            ],
+        )
+        .unwrap();
+
+        let mut probe_list =
+            ListBuilder::new(UInt16Builder::new()).with_field((*list_field).clone());
+        // Probe row 0: [10, 20] — should match
+        probe_list.values().append_value(10u16);
+        probe_list.values().append_value(20u16);
+        probe_list.append(true);
+        // Probe row 1: [99, 88] — same length but different values, must NOT match
+        probe_list.values().append_value(99u16);
+        probe_list.values().append_value(88u16);
+        probe_list.append(true);
+
+        let probe = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(probe_list.finish()),
+                Arc::new(StringArray::from(vec!["match", "no_match"])),
+            ],
+        )
+        .unwrap();
+
+        let result = semi_join(&[build], &["addr"], &[probe], &["addr"]).unwrap();
+        let total: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "only [10,20] should match, not [99,88]");
+
+        let data = result[0]
+            .column_by_name("data")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(data.value(0), "match");
     }
 
     #[test]
