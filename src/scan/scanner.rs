@@ -56,11 +56,14 @@ pub struct KeyFilter {
     /// Column names forming the composite key (in the target/relation table).
     pub columns: Vec<String>,
     /// Pre-built set of serialized composite keys (Arc for cheap clone into closures).
-    key_set: Arc<HashSet<Vec<u8>>>,
+    pub(crate) key_set: Arc<HashSet<Vec<u8>>>,
+    /// Fast set for 2-column keys: u128 = (col0 as u64) << 64 | (col1 as u64).
+    /// Uses FxHash instead of SipHash — ~3x faster for integer keys.
+    pub(crate) key_set_fast: Option<Arc<rustc_hash::FxHashSet<u128>>>,
     /// Sorted unique block numbers for efficient row group pruning.
-    sorted_blocks: Vec<u64>,
+    pub(crate) sorted_blocks: Vec<u64>,
     /// Block number column name in the target table.
-    block_number_column: String,
+    pub(crate) block_number_column: String,
 }
 
 impl KeyFilter {
@@ -120,9 +123,28 @@ impl KeyFilter {
         let mut sorted_blocks: Vec<u64> = block_numbers.iter().copied().collect();
         sorted_blocks.sort_unstable();
 
+        // Build fast u128 set for 2-column integer keys (most common pattern)
+        let key_set_fast = if left_keys.len() == 2 {
+            let mut fast_set = rustc_hash::FxHashSet::default();
+            for key in &key_set {
+                if key.len() == 16 {
+                    let k = u128::from_le_bytes(key[..16].try_into().unwrap());
+                    fast_set.insert(k);
+                }
+            }
+            if fast_set.len() == key_set.len() {
+                Some(Arc::new(fast_set))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         KeyFilter {
             columns: right_keys.iter().map(|s| s.to_string()).collect(),
             key_set: Arc::new(key_set),
+            key_set_fast,
             sorted_blocks,
             block_number_column: target_bn_col.to_string(),
         }
@@ -146,21 +168,21 @@ pub enum HierarchicalMode {
 /// applied as a RowFilter stage, avoiding decode of data columns for non-matching rows.
 pub struct HierarchicalFilter {
     /// Source addresses indexed by group key (serialized block_number + transaction_index).
-    source_addresses: Arc<HashMap<Vec<u8>, Vec<Vec<u32>>>>,
+    pub(crate) source_addresses: Arc<HashMap<Vec<u8>, Vec<Vec<u32>>>>,
     /// Set of first-key values (block_number as u64) for fast pre-filtering.
     /// Most rows don't match any source block, so this cheap check skips ~85-99% of rows
     /// before the expensive composite key build + HashMap lookup.
-    first_key_set: Arc<rustc_hash::FxHashSet<u64>>,
+    pub(crate) first_key_set: Arc<rustc_hash::FxHashSet<u64>>,
     /// Group key column names in the target table (e.g., ["block_number", "transaction_index"]).
     pub group_key_columns: Vec<String>,
     /// Address column name in target table (e.g., "instruction_address", "call_address").
     pub address_column: String,
     /// Whether to find children or parents.
-    mode: HierarchicalMode,
+    pub(crate) mode: HierarchicalMode,
     /// When `true`, same-depth addresses count as a match (cross-table relations).
     /// When `false`, only strictly deeper/shallower addresses match (self-join).
     /// See `find_children` in `hierarchical.rs` for full explanation.
-    inclusive: bool,
+    pub(crate) inclusive: bool,
 }
 
 impl HierarchicalFilter {
@@ -262,7 +284,7 @@ fn extract_address_values(array: &GenericListArray<i32>, row: usize) -> Vec<u32>
 
 /// Build a boolean mask for hierarchical filtering.
 /// Also performs key-in-set check inline, so this can replace a separate KeyFilter stage.
-fn hierarchical_mask(
+pub(crate) fn hierarchical_mask(
     batch: &RecordBatch,
     source_addresses: &HashMap<Vec<u8>, Vec<Vec<u32>>>,
     first_key_set: &rustc_hash::FxHashSet<u64>,
@@ -574,10 +596,29 @@ impl<'a> TypedKeyColumn<'a> {
 
 /// Build a boolean mask: true for rows where composite key is in the set.
 /// Resolves column types once per batch, then uses tight typed loops.
-fn composite_key_in_set_mask(
+pub(crate) fn composite_key_in_set_mask(
     batch: &RecordBatch,
     key_columns: &[String],
     key_set: &HashSet<Vec<u8>>,
+) -> BooleanArray {
+    composite_key_in_set_mask_impl(batch, key_columns, key_set, None)
+}
+
+/// Same as `composite_key_in_set_mask` but uses FxHashSet<u128> fast path when available.
+pub(crate) fn composite_key_in_set_mask_fast(
+    batch: &RecordBatch,
+    key_columns: &[String],
+    key_set: &HashSet<Vec<u8>>,
+    fast_set: Option<&rustc_hash::FxHashSet<u128>>,
+) -> BooleanArray {
+    composite_key_in_set_mask_impl(batch, key_columns, key_set, fast_set)
+}
+
+fn composite_key_in_set_mask_impl(
+    batch: &RecordBatch,
+    key_columns: &[String],
+    key_set: &HashSet<Vec<u8>>,
+    fast_set: Option<&rustc_hash::FxHashSet<u128>>,
 ) -> BooleanArray {
     let len = batch.num_rows();
     let mut builder = BooleanBufferBuilder::new(len);
@@ -592,10 +633,20 @@ fn composite_key_in_set_mask(
         })
         .collect();
 
-    // Fast path for 2-column composite key (most common: block_number + transaction_index)
-    // Uses a fixed-size stack buffer instead of heap-allocated Vec.
+    // Fast path for 2-column composite key with FxHashSet<u128> (~3x faster than SipHash)
     if typed_cols.len() == 2 {
         if let (Some(ref c0), Some(ref c1)) = (&typed_cols[0], &typed_cols[1]) {
+            if let Some(fast) = fast_set {
+                let mut key_buf = [0u8; 16];
+                for row in 0..len {
+                    c0.write_to_buf(&mut key_buf[..8], row);
+                    c1.write_to_buf(&mut key_buf[8..16], row);
+                    let k = u128::from_le_bytes(key_buf);
+                    builder.append(fast.contains(&k));
+                }
+                return BooleanArray::new(builder.finish(), None);
+            }
+            // Fallback: 2-column with std HashSet
             let mut key_buf = [0u8; 16];
             for row in 0..len {
                 c0.write_to_buf(&mut key_buf[..8], row);
@@ -854,10 +905,14 @@ fn scan_row_groups(
                 let key_proj = ProjectionMask::roots(parquet_schema, key_col_indices);
                 let key_columns = Arc::new(kf.columns.clone());
                 let key_set = kf.key_set.clone();
+                let key_set_fast = kf.key_set_fast.clone();
                 filter_stages.push(Box::new(ArrowPredicateFn::new(
                     key_proj,
                     move |batch: RecordBatch| {
-                        Ok(composite_key_in_set_mask(&batch, &key_columns, &key_set))
+                        Ok(composite_key_in_set_mask_fast(
+                            &batch, &key_columns, &key_set,
+                            key_set_fast.as_deref(),
+                        ))
                     },
                 )));
             }
@@ -1110,7 +1165,7 @@ fn block_number_in_set_mask(
     BooleanArray::from(vec![true; len])
 }
 
-fn block_range_mask(
+pub(crate) fn block_range_mask(
     column: &Arc<dyn Array>,
     from_block: Option<u64>,
     to_block: Option<u64>,
@@ -1182,7 +1237,7 @@ fn project_batch(batch: &RecordBatch, output_schema: &SchemaRef) -> Result<Recor
 }
 
 /// Build the output Arrow schema from requested column names.
-fn build_output_schema(table_schema: &SchemaRef, columns: &[&str]) -> SchemaRef {
+pub(crate) fn build_output_schema(table_schema: &SchemaRef, columns: &[&str]) -> SchemaRef {
     let fields: Vec<_> = columns
         .iter()
         .filter_map(|name| table_schema.field_with_name(name).ok().cloned())

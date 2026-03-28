@@ -2,7 +2,8 @@ use anyhow::{anyhow, Result};
 use arrow::array::*;
 use arrow::compute;
 use arrow::datatypes::SchemaRef;
-use std::collections::HashMap;
+use std::borrow::Borrow;
+use std::collections::{HashMap, HashSet};
 
 /// Extract a List value as a Vec<u32> from a row.
 /// Supports List<UInt16>, List<UInt32>, and List<Int32>.
@@ -16,7 +17,9 @@ fn extract_address(array: &GenericListArray<i32>, row: usize) -> Vec<u32> {
     } else if let Some(arr) = values.as_any().downcast_ref::<UInt32Array>() {
         (0..arr.len()).map(|i| arr.value(i)).collect()
     } else if let Some(arr) = values.as_any().downcast_ref::<Int32Array>() {
-        (0..arr.len()).map(|i| arr.value(i) as u32).collect()
+        (0..arr.len())
+            .filter_map(|i| u32::try_from(arr.value(i)).ok())
+            .collect()
     } else {
         Vec::new()
     }
@@ -26,43 +29,74 @@ fn extract_address(array: &GenericListArray<i32>, row: usize) -> Vec<u32> {
 #[derive(Clone, Eq, PartialEq, Hash)]
 struct GroupKey(Vec<u8>);
 
-/// Returns `Ok(None)` when any key column is null at this row (row is ungroupable).
-fn make_group_key(
-    batch: &RecordBatch,
-    row: usize,
-    key_indices: &[usize],
-) -> Result<Option<GroupKey>> {
-    let mut buf = Vec::with_capacity(key_indices.len() * 8);
-    for &idx in key_indices {
+impl Borrow<[u8]> for GroupKey {
+    fn borrow(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Typed group key extractor — downcasts once per batch.
+enum GroupKeyCol<'a> {
+    UInt64(&'a UInt64Array),
+    UInt32(&'a UInt32Array),
+    UInt16(&'a UInt16Array),
+    Int32(&'a Int32Array),
+}
+
+impl<'a> GroupKeyCol<'a> {
+    fn resolve(batch: &'a RecordBatch, idx: usize) -> Result<Self> {
         let col = batch.column(idx);
         if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
-            if a.is_null(row) {
-                return Ok(None);
-            }
-            buf.extend_from_slice(&a.value(row).to_le_bytes());
+            Ok(Self::UInt64(a))
         } else if let Some(a) = col.as_any().downcast_ref::<UInt32Array>() {
-            if a.is_null(row) {
-                return Ok(None);
-            }
-            buf.extend_from_slice(&(a.value(row) as u64).to_le_bytes());
+            Ok(Self::UInt32(a))
         } else if let Some(a) = col.as_any().downcast_ref::<UInt16Array>() {
-            if a.is_null(row) {
-                return Ok(None);
-            }
-            buf.extend_from_slice(&(a.value(row) as u64).to_le_bytes());
+            Ok(Self::UInt16(a))
         } else if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
-            if a.is_null(row) {
-                return Ok(None);
-            }
-            buf.extend_from_slice(&((a.value(row) as u32) as u64).to_le_bytes());
+            Ok(Self::Int32(a))
         } else {
-            return Err(anyhow!(
+            Err(anyhow!(
                 "unsupported group key column type: {:?}",
                 col.data_type()
-            ));
+            ))
         }
     }
-    Ok(Some(GroupKey(buf)))
+
+    /// Append this column's value at `row` to `buf`. Returns false if null.
+    #[inline]
+    fn append(&self, row: usize, buf: &mut Vec<u8>) -> bool {
+        match self {
+            Self::UInt64(a) => {
+                if a.is_null(row) { return false; }
+                buf.extend_from_slice(&a.value(row).to_le_bytes());
+            }
+            Self::UInt32(a) => {
+                if a.is_null(row) { return false; }
+                buf.extend_from_slice(&(a.value(row) as u64).to_le_bytes());
+            }
+            Self::UInt16(a) => {
+                if a.is_null(row) { return false; }
+                buf.extend_from_slice(&(a.value(row) as u64).to_le_bytes());
+            }
+            Self::Int32(a) => {
+                if a.is_null(row) { return false; }
+                buf.extend_from_slice(&((a.value(row) as u32) as u64).to_le_bytes());
+            }
+        }
+        true
+    }
+}
+
+/// Write group key into `buf`, returns false if any column is null.
+#[inline]
+fn write_group_key(cols: &[GroupKeyCol], row: usize, buf: &mut Vec<u8>) -> bool {
+    buf.clear();
+    for col in cols {
+        if !col.append(row, buf) {
+            return false;
+        }
+    }
+    true
 }
 
 fn resolve_indices(schema: &SchemaRef, columns: &[&str]) -> Result<Vec<usize>> {
@@ -104,10 +138,12 @@ pub fn find_children(
     }
 
     // Build an index: group_key -> set of source addresses
-    let mut source_addresses: HashMap<GroupKey, Vec<Vec<u32>>> = HashMap::new();
+    let mut source_addresses: HashMap<GroupKey, HashSet<Vec<u32>>> = HashMap::new();
 
+    let mut buf = Vec::with_capacity(group_key_columns.len() * 8);
     for batch in source_batches {
         let key_indices = resolve_indices(batch.schema_ref(), group_key_columns)?;
+        let key_cols: Vec<GroupKeyCol> = key_indices.iter().map(|&i| GroupKeyCol::resolve(batch, i)).collect::<Result<_>>()?;
         let addr_idx = batch
             .schema()
             .index_of(source_address_column)
@@ -116,19 +152,17 @@ pub fn find_children(
             .column(addr_idx)
             .as_any()
             .downcast_ref::<GenericListArray<i32>>()
-            .ok_or_else(|| {
-                anyhow!(
-                    "'{}' must be a List<UInt32> column",
-                    source_address_column
-                )
-            })?;
+            .ok_or_else(|| anyhow!("'{}' must be a List<UInt32> column", source_address_column))?;
 
         for row in 0..batch.num_rows() {
-            let Some(gk) = make_group_key(batch, row, &key_indices)? else {
+            if addr_array.is_null(row) {
                 continue;
-            };
+            }
+            if !write_group_key(&key_cols, row, &mut buf) {
+                continue;
+            }
             let addr = extract_address(addr_array, row);
-            source_addresses.entry(gk).or_default().push(addr);
+            source_addresses.entry(GroupKey(buf.clone())).or_default().insert(addr);
         }
     }
 
@@ -136,6 +170,7 @@ pub fn find_children(
     let mut result = Vec::new();
     for batch in target_batches {
         let key_indices = resolve_indices(batch.schema_ref(), group_key_columns)?;
+        let key_cols: Vec<GroupKeyCol> = key_indices.iter().map(|&i| GroupKeyCol::resolve(batch, i)).collect::<Result<_>>()?;
         let addr_idx = batch
             .schema()
             .index_of(target_address_column)
@@ -144,28 +179,22 @@ pub fn find_children(
             .column(addr_idx)
             .as_any()
             .downcast_ref::<GenericListArray<i32>>()
-            .ok_or_else(|| {
-                anyhow!(
-                    "'{}' must be a List<UInt32> column",
-                    target_address_column
-                )
-            })?;
+            .ok_or_else(|| anyhow!("'{}' must be a List<UInt32> column", target_address_column))?;
 
         let mut matches = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
-            // Null addresses never match (e.g., events without a call)
             if addr_array.is_null(row) {
                 matches.push(false);
                 continue;
             }
-            let Some(gk) = make_group_key(batch, row, &key_indices)? else {
+            if !write_group_key(&key_cols, row, &mut buf) {
                 matches.push(false);
                 continue;
-            };
+            }
             let target_addr = extract_address(addr_array, row);
 
             let is_child = source_addresses
-                .get(&gk)
+                .get(buf.as_slice())
                 .map(|addrs| {
                     addrs.iter().any(|parent| {
                         if inclusive {
@@ -219,10 +248,12 @@ pub fn find_parents(
     }
 
     // Build index: group_key -> set of source addresses
-    let mut source_addresses: HashMap<GroupKey, Vec<Vec<u32>>> = HashMap::new();
+    let mut source_addresses: HashMap<GroupKey, HashSet<Vec<u32>>> = HashMap::new();
+    let mut buf = Vec::with_capacity(group_key_columns.len() * 8);
 
     for batch in source_batches {
         let key_indices = resolve_indices(batch.schema_ref(), group_key_columns)?;
+        let key_cols: Vec<GroupKeyCol> = key_indices.iter().map(|&i| GroupKeyCol::resolve(batch, i)).collect::<Result<_>>()?;
         let addr_idx = batch
             .schema()
             .index_of(source_address_column)
@@ -231,19 +262,17 @@ pub fn find_parents(
             .column(addr_idx)
             .as_any()
             .downcast_ref::<GenericListArray<i32>>()
-            .ok_or_else(|| {
-                anyhow!(
-                    "'{}' must be a List<UInt32> column",
-                    source_address_column
-                )
-            })?;
+            .ok_or_else(|| anyhow!("'{}' must be a List<UInt32> column", source_address_column))?;
 
         for row in 0..batch.num_rows() {
-            let Some(gk) = make_group_key(batch, row, &key_indices)? else {
+            if addr_array.is_null(row) {
                 continue;
-            };
+            }
+            if !write_group_key(&key_cols, row, &mut buf) {
+                continue;
+            }
             let addr = extract_address(addr_array, row);
-            source_addresses.entry(gk).or_default().push(addr);
+            source_addresses.entry(GroupKey(buf.clone())).or_default().insert(addr);
         }
     }
 
@@ -251,6 +280,7 @@ pub fn find_parents(
     let mut result = Vec::new();
     for batch in target_batches {
         let key_indices = resolve_indices(batch.schema_ref(), group_key_columns)?;
+        let key_cols: Vec<GroupKeyCol> = key_indices.iter().map(|&i| GroupKeyCol::resolve(batch, i)).collect::<Result<_>>()?;
         let addr_idx = batch
             .schema()
             .index_of(target_address_column)
@@ -259,12 +289,7 @@ pub fn find_parents(
             .column(addr_idx)
             .as_any()
             .downcast_ref::<GenericListArray<i32>>()
-            .ok_or_else(|| {
-                anyhow!(
-                    "'{}' must be a List<UInt32> column",
-                    target_address_column
-                )
-            })?;
+            .ok_or_else(|| anyhow!("'{}' must be a List<UInt32> column", target_address_column))?;
 
         let mut matches = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
@@ -272,14 +297,14 @@ pub fn find_parents(
                 matches.push(false);
                 continue;
             }
-            let Some(gk) = make_group_key(batch, row, &key_indices)? else {
+            if !write_group_key(&key_cols, row, &mut buf) {
                 matches.push(false);
                 continue;
-            };
+            }
             let target_addr = extract_address(addr_array, row);
 
             let is_parent = source_addresses
-                .get(&gk)
+                .get(buf.as_slice())
                 .map(|addrs| {
                     addrs.iter().any(|child| {
                         if inclusive {
@@ -535,6 +560,122 @@ mod tests {
 
         let total: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 0);
+    }
+
+    /// Null source address must be skipped, not indexed as [] (which is a prefix
+    /// of every address and would cause the entire transaction group to match).
+    #[test]
+    fn test_find_children_null_source_address_skipped() {
+        // Source: one row with NULL instruction_address
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("block_number", DataType::UInt64, false),
+            Field::new("transaction_index", DataType::UInt32, false),
+            Field::new(
+                "instruction_address",
+                DataType::List(Arc::new(Field::new("item", DataType::UInt32, true))),
+                true, // nullable
+            ),
+            Field::new("data", DataType::Utf8, false),
+        ]));
+
+        let mut list_builder = ListBuilder::new(UInt32Builder::new())
+            .with_field(Field::new("item", DataType::UInt32, true));
+        list_builder.append_null(); // NULL address
+
+        let source = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(list_builder.finish()),
+                Arc::new(StringArray::from(vec!["null_source"])),
+            ],
+        )
+        .unwrap()];
+
+        // Target: a real child at [0, 0]
+        let target = vec![make_instruction_batch(
+            vec![1],
+            vec![0],
+            vec![vec![0, 0]],
+            vec!["child"],
+        )];
+
+        let result = find_children(
+            &source,
+            &target,
+            &["block_number", "transaction_index"],
+            "instruction_address",
+            "instruction_address",
+            false,
+        )
+        .unwrap();
+
+        let total: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0, "null source address must not match any target");
+    }
+
+    /// Negative Int32 address elements must be dropped, not wrap to huge u32.
+    #[test]
+    fn test_extract_address_negative_int32_dropped() {
+        let list_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("block_number", DataType::UInt64, false),
+            Field::new("transaction_index", DataType::UInt32, false),
+            Field::new("addr", DataType::List(list_field.clone()), false),
+            Field::new("data", DataType::Utf8, false),
+        ]));
+
+        // Source: address [0, -1] — the -1 should be filtered out
+        let mut src_list =
+            ListBuilder::new(Int32Builder::new()).with_field((*list_field).clone());
+        src_list.values().append_value(0i32);
+        src_list.values().append_value(-1i32);
+        src_list.append(true);
+
+        let source = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(src_list.finish()),
+                Arc::new(StringArray::from(vec!["src"])),
+            ],
+        )
+        .unwrap()];
+
+        // Target: address [0] — would match [0, 4294967295] as child if -1 wrapped
+        let mut tgt_list =
+            ListBuilder::new(Int32Builder::new()).with_field((*list_field).clone());
+        tgt_list.values().append_value(0i32);
+        tgt_list.values().append_value(0i32);
+        tgt_list.append(true);
+
+        let target = vec![RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![1])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(tgt_list.finish()),
+                Arc::new(StringArray::from(vec!["tgt"])),
+            ],
+        )
+        .unwrap()];
+
+        // Source addr is [0] (after dropping -1), target is [0, 0] → target IS a child of [0]
+        let result = find_children(
+            &source,
+            &target,
+            &["block_number", "transaction_index"],
+            "addr",
+            "addr",
+            false,
+        )
+        .unwrap();
+
+        let total: usize = result.iter().map(|b| b.num_rows()).sum();
+        // [0, 0] is a child of [0] — this should match
+        assert_eq!(total, 1);
     }
 
     #[test]
